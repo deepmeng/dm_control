@@ -72,14 +72,6 @@ _GRID_POSITIONS = {
     'bottom right': enums.mjtGridPos.mjGRID_BOTTOMRIGHT,
 }
 
-_DIVERGENCE_WARNINGS = [
-    enums.mjtWarning.mjWARN_INERTIA,
-    enums.mjtWarning.mjWARN_BADQPOS,
-    enums.mjtWarning.mjWARN_BADQVEL,
-    enums.mjtWarning.mjWARN_BADQACC,
-    enums.mjtWarning.mjWARN_BADCTRL,
-]
-
 Contexts = collections.namedtuple('Contexts', ['gl', 'mujoco'])
 Selected = collections.namedtuple(
     'Selected', ['body', 'geom', 'world_position'])
@@ -111,6 +103,8 @@ class Physics(_control.Physics):
   [0] http://www.mujoco.org/book/modeling.html
   """
 
+  _contexts = None
+
   def __init__(self, data):
     """Initializes a new `Physics` instance.
 
@@ -127,13 +121,10 @@ class Physics(_control.Physics):
     """
     self.data.ctrl[:] = np.asarray(control)
 
-  def step(self, n_sub_steps=1):
+  def step(self):
     """Advances physics with up-to-date position and velocity dependent fields.
 
     The actuation can be updated by calling the `set_control` function first.
-
-    Args:
-      n_sub_steps: Optional number of times to advance the physics. Default 1.
     """
     # In the case of Euler integration we assume mj_step1 has already been
     # called for this state, finish the step with mj_step2 and then update all
@@ -141,17 +132,16 @@ class Physics(_control.Physics):
     # (most of) mjData is in sync with qpos and qvel. In the case of non-Euler
     # integrators (e.g. RK4) an additional mj_step1 must be called after the
     # last mj_step to ensure mjData syncing.
-    for _ in xrange(n_sub_steps):
-      if self.model.opt.integrator == enums.mjtIntegrator.mjINT_EULER:
-        mjlib.mj_step2(self.model.ptr, self.data.ptr)
-        mjlib.mj_step1(self.model.ptr, self.data.ptr)
-      else:
-        mjlib.mj_step(self.model.ptr, self.data.ptr)
+    if self.model.opt.integrator == enums.mjtIntegrator.mjINT_EULER:
+      mjlib.mj_step2(self.model.ptr, self.data.ptr)
+      mjlib.mj_step1(self.model.ptr, self.data.ptr)
+    else:
+      mjlib.mj_step(self.model.ptr, self.data.ptr)
 
     if self.model.opt.integrator != enums.mjtIntegrator.mjINT_EULER:
       mjlib.mj_step1(self.model.ptr, self.data.ptr)
 
-    self.check_divergence()
+    self.check_invalid_state()
 
   def render(self, height=240, width=320, camera_id=-1, overlays=(),
              depth=False, scene_option=None):
@@ -177,8 +167,10 @@ class Physics(_control.Physics):
     """
     camera = Camera(
         physics=self, height=height, width=width, camera_id=camera_id)
-    return camera.render(
+    image = camera.render(
         overlays=overlays, depth=depth, scene_option=scene_option)
+    camera._scene.free()  # pylint: disable=protected-access
+    return image
 
   def get_state(self):
     """Returns the physics state.
@@ -253,16 +245,16 @@ class Physics(_control.Physics):
     # http://www.mujoco.org/book/programming.html#siForward
     mjlib.mj_forward(self.model.ptr, self.data.ptr)
 
-  def check_divergence(self):
-    """Raises a `base.PhysicsError` if the simulation state is divergent."""
-    warning_counts = [self.data.warning[i].number for i in _DIVERGENCE_WARNINGS]
+  def check_invalid_state(self):
+    """Raises a `base.PhysicsError` if the simulation state is invalid."""
+    warning_counts = [self.data.warning[i].number for i in
+                      xrange(enums.mjtWarning.mjNWARNING)]
     if any(warning_counts):
       warning_names = []
       for i in np.where(warning_counts)[0]:
-        field_idx = _DIVERGENCE_WARNINGS[i]
-        warning_names.append(enums.mjtWarning._fields[field_idx])
+        warning_names.append(enums.mjtWarning._fields[i])
       raise _control.PhysicsError(
-          'Physics state has diverged. Warning(s) raised: {}'.format(
+          'Physics state is invalid. Warning(s) raised: {}'.format(
               ', '.join(warning_names)))
 
   def __getstate__(self):
@@ -286,7 +278,8 @@ class Physics(_control.Physics):
   def _reload_from_data(self, data):
     """Initializes a new or existing `Physics` instance from a `wrapper.MjData`.
 
-    Assigns all attributes and sets up rendering contexts and named indexing.
+    Assigns all attributes, sets up named indexing, and creates rendering
+    contexts if rendering is enabled.
 
     The default constructor as well as the other `reload_from` methods should
     delegate to this method.
@@ -296,20 +289,8 @@ class Physics(_control.Physics):
     """
     self._data = data
 
-    # Forcibly clear the previous context to avoid problems with GL
-    # implementations which do not support multiple contexts on a given device.
-    if hasattr(self, '_contexts'):
-      self._contexts.gl.free_context()
-
-    # Set up rendering context. Need to provide at least one rendering api in
-    # the BUILD target.
-    render_context = render.Renderer(_MAX_WIDTH, _MAX_HEIGHT)
-    mujoco_context = wrapper.MjrContext()
-    with render_context.make_current(_MAX_WIDTH, _MAX_HEIGHT):
-      mjlib.mjr_makeContext(self.model.ptr, mujoco_context.ptr, _FONT_SCALE)
-      mjlib.mjr_setBuffer(
-          enums.mjtFramebuffer.mjFB_OFFSCREEN, mujoco_context.ptr)
-    self._contexts = Contexts(gl=render_context, mujoco=mujoco_context)
+    if not render.DISABLED:
+      self._make_rendering_contexts()
 
     # Call kinematics update to enable rendering.
     self.after_reset()
@@ -319,6 +300,16 @@ class Physics(_control.Physics):
     self._named = NamedIndexStructs(
         model=index.struct_indexer(self.model, 'mjmodel', axis_indexers),
         data=index.struct_indexer(self.data, 'mjdata', axis_indexers),)
+
+  def free(self):
+    """Frees the native MuJoCo data structures held by this `Physics` instance.
+
+    This is an advanced feature for use when manual memory management is
+    necessary. This `Physics` object MUST NOT be used after this function has
+    been called.
+    """
+    self.data.free()
+    self.model.free()
 
   @classmethod
   def from_model(cls, model):
@@ -408,9 +399,27 @@ class Physics(_control.Physics):
   def named(self):
     return self._named
 
+  def _make_rendering_contexts(self):
+    """Creates the OpenGL and MuJoCo rendering contexts."""
+    # Forcibly clear the previous GL context to avoid problems with GL
+    # implementations which do not support multiple contexts on a given device.
+    if self._contexts:
+      self._contexts.gl.free()
+    # Create the OpenGL context.
+    render_context = render.Renderer(_MAX_WIDTH, _MAX_HEIGHT)
+    # Create the MuJoCo context.
+    mujoco_context = wrapper.MjrContext()
+    with render_context.make_current(_MAX_WIDTH, _MAX_HEIGHT):
+      mjlib.mjr_makeContext(self.model.ptr, mujoco_context.ptr, _FONT_SCALE)
+      mjlib.mjr_setBuffer(
+          enums.mjtFramebuffer.mjFB_OFFSCREEN, mujoco_context.ptr)
+    self._contexts = Contexts(gl=render_context, mujoco=mujoco_context)
+
   @property
   def contexts(self):
     """Returns a `Contexts` namedtuple, used in `Camera`s and rendering code."""
+    if render.DISABLED:
+      raise RuntimeError(render.DISABLED_MESSAGE)
     return self._contexts
 
   @property
@@ -745,7 +754,7 @@ class TextOverlay(object):
 
 
 def action_spec(physics):
-  """Returns an `BoundedArraySpec` matching the `Physics` actuators."""
+  """Returns a `BoundedArraySpec` matching the `physics` actuators."""
   num_actions = physics.model.nu
   is_limited = physics.model.actuator_ctrllimited.ravel().astype(np.bool)
   control_range = physics.model.actuator_ctrlrange

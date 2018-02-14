@@ -42,7 +42,9 @@ class RunThreadedTest(absltest.TestCase):
     mock_threading.Thread = mock.MagicMock(side_effect=mock_threads)
 
     test_decorator = decorators.run_threaded(num_threads=num_threads)
-    test_runner = test_decorator(mock.MagicMock())
+    tested_method = mock.MagicMock()
+    tested_method.__name__ = "foo"
+    test_runner = test_decorator(tested_method)
     test_runner(self)
 
     for thread in mock_threads:
@@ -53,6 +55,7 @@ class RunThreadedTest(absltest.TestCase):
     calls_per_thread = 5
 
     tested_method = mock.MagicMock()
+    tested_method.__name__ = "foo"
     test_decorator = decorators.run_threaded(
         num_threads=1, calls_per_thread=calls_per_thread)
     test_runner = test_decorator(tested_method)

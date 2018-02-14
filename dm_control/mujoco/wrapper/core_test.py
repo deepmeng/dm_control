@@ -19,6 +19,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import ctypes
+import gc
 import os
 
 # Internal dependencies.
@@ -117,6 +119,19 @@ class CoreTest(parameterized.TestCase):
     with self.assertRaises(core.Error):
       # Should fail to load without the assets
       core.MjModel.from_xml_string(MODEL_WITH_ASSETS)
+
+  def testVFSFilenameTooLong(self):
+    limit = core._MAX_VFS_FILENAME_CHARACTERS
+    contents = "fake contents"
+    valid_filename = "a" * limit
+    with core._temporary_vfs({valid_filename: contents}):
+      pass
+    invalid_filename = "a" * (limit + 1)
+    expected_message = core._VFS_FILENAME_TOO_LONG.format(
+        length=(limit + 1), limit=limit, filename=invalid_filename)
+    with self.assertRaisesWithLiteralMatch(ValueError, expected_message):
+      with core._temporary_vfs({invalid_filename: contents}):
+        pass
 
   def testSaveLastParsedModelToXML(self):
     save_xml_path = os.path.join(OUT_DIR, "tmp_humanoid.xml")
@@ -372,6 +387,36 @@ class CoreTest(parameterized.TestCase):
                                  "not a value in `enums.mjtDisableBit`"):
       with self.model.disable(-99):
         pass
+
+  @parameterized.named_parameters(
+      ("MjModel",
+       lambda _: core.MjModel.from_xml_path(HUMANOID_XML_PATH),
+       "mj_deleteModel"),
+      ("MjData",
+       lambda self: core.MjData(self.model),
+       "mj_deleteData"),
+      ("MjvScene",
+       lambda _: core.MjvScene(),
+       "mjv_freeScene"))
+  def testFree(self, constructor, destructor_name):
+    for _ in xrange(5):
+      destructor = getattr(mjlib, destructor_name)
+      with mock.patch.object(
+          core.mjlib, destructor_name, wraps=destructor) as mock_destructor:
+        wrapper = constructor(self)
+
+      expected_address = ctypes.addressof(wrapper.ptr.contents)
+      wrapper.free()
+      self.assertIsNone(wrapper.ptr)
+
+      mock_destructor.assert_called_once()
+      pointer = mock_destructor.call_args[0][0]
+      actual_address = ctypes.addressof(pointer.contents)
+      self.assertEqual(expected_address, actual_address)
+
+      # Explicit freeing should not break any automatic GC triggered later.
+      del wrapper
+      gc.collect()
 
 
 def _get_attributes_test_params():

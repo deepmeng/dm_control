@@ -18,11 +18,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import unittest
+
 # Internal dependencies.
 
 from absl.testing import absltest
 from absl.testing import parameterized
 
+from dm_control import render
 from dm_control.mujoco import engine
 from dm_control.mujoco import wrapper
 from dm_control.mujoco.testing import assets
@@ -31,6 +34,7 @@ from dm_control.mujoco.wrapper.mjbindings import mjlib
 
 from dm_control.rl import control
 
+import mock
 import numpy as np
 from six.moves import cPickle
 from six.moves import xrange  # pylint: disable=redefined-builtin
@@ -62,12 +66,14 @@ class MujocoEngineTest(parameterized.TestCase):
         raise AssertionError("Attribute '{}' differs from expected value. {}"
                              "".format(name, e.message))
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   @parameterized.parameters(0, 'cart', u'cart')
   def testCameraIndexing(self, camera_id):
     height, width = 480, 640
     _ = engine.Camera(
         self._physics, height, width, camera_id=camera_id)
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testDepthRender(self):
     plane_and_box = """
     <mujoco>
@@ -85,6 +91,7 @@ class MujocoEngineTest(parameterized.TestCase):
     # Furthest pixels should be 3m away (depth is orthographic)
     np.testing.assert_approx_equal(pixels.max(), 3.0, 3)
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testTextOverlay(self):
     height, width = 480, 640
     overlay = engine.TextOverlay(title='Title', body='Body', style='big',
@@ -96,6 +103,7 @@ class MujocoEngineTest(parameterized.TestCase):
     self.assertFalse(np.all(no_overlay == with_overlay),
                      msg='Images are identical with and without text overlay.')
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testSceneOption(self):
     height, width = 480, 640
     scene_option = wrapper.MjvOption()
@@ -114,6 +122,7 @@ class MujocoEngineTest(parameterized.TestCase):
                             ((0.5, 0.1), (0, 0)),  # ground
                             ((0.9, 0.9), (None, None)),  # sky
                            )
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testCameraSelection(self, coordinates, expected_selection):
     height, width = 480, 640
     camera = engine.Camera(self._physics, height, width, camera_id=0)
@@ -126,6 +135,7 @@ class MujocoEngineTest(parameterized.TestCase):
     selected = camera.select(coordinates)
     self.assertEqual(expected_selection, selected[:2])
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testMovableCameraSetGetPose(self):
     height, width = 240, 320
 
@@ -153,6 +163,7 @@ class MujocoEngineTest(parameterized.TestCase):
 
     self.assertFalse(np.all(image == camera.render()))
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testRenderExceptions(self):
     max_width = self._physics.model.vis.global_.offwidth
     max_height = self._physics.model.vis.global_.offheight
@@ -166,6 +177,7 @@ class MujocoEngineTest(parameterized.TestCase):
     with self.assertRaisesRegexp(ValueError, 'camera_id'):
       self._physics.render(max_height, max_width, camera_id=-2)
 
+  @unittest.skipIf(render.DISABLED, reason=render.DISABLED_MESSAGE)
   def testPhysicsRenderMethod(self):
     height, width = 240, 320
     image = self._physics.render(height=height, width=width)
@@ -211,6 +223,19 @@ class MujocoEngineTest(parameterized.TestCase):
         MODEL_WITH_ASSETS, assets=ASSETS)
     physics.reload_from_xml_string(MODEL_WITH_ASSETS, assets=ASSETS)
 
+  def testFree(self):
+    def mock_free(obj):
+      return mock.patch.object(obj, 'free', wraps=obj.free)
+
+    with mock_free(self._physics.model) as mock_free_model:
+      with mock_free(self._physics.data) as mock_free_data:
+        self._physics.free()
+
+    mock_free_model.assert_called_once()
+    mock_free_data.assert_called_once()
+    self.assertIsNone(self._physics.model.ptr)
+    self.assertIsNone(self._physics.data.ptr)
+
   @parameterized.parameters(
       'mjWARN_INERTIA',
       'mjWARN_BADQPOS',
@@ -222,9 +247,9 @@ class MujocoEngineTest(parameterized.TestCase):
     with self._physics.reset_context():
       self._physics.data.warning[warning_enum].number = 1
     with self.assertRaisesRegexp(control.PhysicsError, warning_name):
-      self._physics.check_divergence()
+      self._physics.check_invalid_state()
     self._physics.reset()
-    self._physics.check_divergence()
+    self._physics.check_invalid_state()
 
   @parameterized.parameters(float('inf'), float('nan'), 1e15)
   def testBadQpos(self, bad_value):
@@ -232,10 +257,10 @@ class MujocoEngineTest(parameterized.TestCase):
       self._physics.data.qpos[0] = bad_value
     mjlib.mj_checkPos(self._physics.model.ptr, self._physics.data.ptr)
     with self.assertRaises(control.PhysicsError):
-      self._physics.check_divergence()
+      self._physics.check_invalid_state()
     self._physics.reset()
     mjlib.mj_checkPos(self._physics.model.ptr, self._physics.data.ptr)
-    self._physics.check_divergence()
+    self._physics.check_invalid_state()
 
   def testNanControl(self):
     with self._physics.reset_context():
@@ -244,7 +269,7 @@ class MujocoEngineTest(parameterized.TestCase):
     # Apply the controls.
     mjlib.mj_step(self._physics.model.ptr, self._physics.data.ptr)
     with self.assertRaisesRegexp(control.PhysicsError, 'mjWARN_BADCTRL'):
-      self._physics.check_divergence()
+      self._physics.check_invalid_state()
 
   @parameterized.named_parameters(
       ('_copy', lambda x: x.copy()),
@@ -310,6 +335,15 @@ class MujocoEngineTest(parameterized.TestCase):
     self.assertEqual(np.float, spec.dtype)
     np.testing.assert_array_equal(spec.minimum, [-np.inf, -1.0])
     np.testing.assert_array_equal(spec.maximum, [np.inf, 2.0])
+
+  def testErrorOnContextAccessIfRenderingDisabled(self):
+    expected_message = 'Error message'
+    with mock.patch(engine.__name__ + '.render') as mock_render:
+      mock_render.DISABLED = True
+      mock_render.DISABLED_MESSAGE = expected_message
+      physics = engine.Physics.from_xml_path(MODEL_PATH)
+      with self.assertRaisesWithLiteralMatch(RuntimeError, expected_message):
+        _ = physics.contexts
 
 
 if __name__ == '__main__':
